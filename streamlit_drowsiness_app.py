@@ -1,4 +1,3 @@
-# streamlit_drowsiness_app.py
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 import av
@@ -13,17 +12,19 @@ import sys
 # === CONFIG ===
 MODEL_PATH = "best_model.pth"
 CASCADE_PATH = "haarcascade_frontalface_default.xml"
+ALERT_SOUND = "alert.mp3"
 MODEL_NAME = "mobilenetv3_large_100"
 CLASS_NAMES = ["Drowsy", "Non Drowsy"]
 CONFIDENCE_THRESHOLD = 0.80
+DROWSY_FRAME_THRESHOLD = 45  # ~3 seconds if running at ~15 FPS
 
-# === Resource Helper (for local + cloud deployment) ===
+# === Resource Path Helper ===
 def get_resource_path(filename):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, filename)
     return os.path.join(os.path.dirname(__file__), filename)
 
-# === Load Model (cache to avoid reloading) ===
+# === Load Model ===
 @st.cache_resource
 def load_model():
     model = timm.create_model(MODEL_NAME, pretrained=False)
@@ -45,17 +46,20 @@ transform = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-# === Video Transformer with Smoothing ===
+# === Drowsiness Detector ===
 class DrowsinessDetector(VideoTransformerBase):
     def __init__(self):
         cascade_file = get_resource_path(CASCADE_PATH)
         self.face_cascade = cv2.CascadeClassifier(cascade_file)
 
         self.frame_count = 0
-        self.prediction_interval = 10  # Predict every 10 frames
+        self.prediction_interval = 10
         self.prediction_history = []
         self.max_history = 10
         self.last_label = "Waiting..."
+
+        self.drowsy_frames = 0
+        self.alert_triggered = False
 
     def transform(self, frame):
         self.frame_count += 1
@@ -82,8 +86,14 @@ class DrowsinessDetector(VideoTransformerBase):
                 if len(self.prediction_history) > self.max_history:
                     self.prediction_history.pop(0)
 
-                # Majority vote
                 self.last_label = max(set(self.prediction_history), key=self.prediction_history.count)
+
+                # Count drowsy frames
+                if self.last_label == "Drowsy":
+                    self.drowsy_frames += 1
+                else:
+                    self.drowsy_frames = 0
+                    self.alert_triggered = False
 
             cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
             cv2.putText(img, self.last_label, (x, y - 10),
@@ -92,11 +102,11 @@ class DrowsinessDetector(VideoTransformerBase):
         return img
 
 # === Streamlit UI ===
-st.set_page_config(page_title="Drowsiness Detection", layout="centered")
+st.set_page_config(page_title="Driver Drowsiness Detection", layout="centered")
 st.title("😴 Real-Time Driver Drowsiness Detection")
-st.markdown("Using MobileNetV3 + Face Detection with Smoothed Output (mobile friendly)")
+st.markdown("Detecting drowsy drivers using webcam & MobileNetV3. Works on mobile too!")
 
-webrtc_streamer(
+ctx = webrtc_streamer(
     key="drowsiness",
     video_transformer_factory=DrowsinessDetector,
     media_stream_constraints={"video": True, "audio": False},
@@ -105,3 +115,10 @@ webrtc_streamer(
         "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
     }
 )
+
+# === Play Sound Alert if Drowsy for >= 3 Seconds ===
+if ctx and ctx.video_transformer:
+    detector = ctx.video_transformer
+    if detector.drowsy_frames >= DROWSY_FRAME_THRESHOLD and not detector.alert_triggered:
+        st.audio(get_resource_path(ALERT_SOUND), autoplay=True)
+        detector.alert_triggered = True
